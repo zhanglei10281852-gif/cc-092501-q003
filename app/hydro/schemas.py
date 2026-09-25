@@ -1,6 +1,22 @@
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field, field_validator
+
+OBSERVATION_CHANNELS = ("isotope_d18o", "isotope_d2h", "solute_mg_l")
+
+
+class ObservationSpec(BaseModel):
+    """单个测量通道的观测类型声明。
+
+    quantitative：定量值，按平方残差参与反演；
+    censored：左删失（实验室报告“低于检出限”），数值栏填写报告给出的检出限，
+        反演中按单侧不等式约束参与，而不是当作 0 或精确值；
+    missing：真正缺失（如样品量不足未测），不参与反演。
+    """
+
+    type: Literal["quantitative", "censored", "missing"]
 
 
 class WellCreate(BaseModel):
@@ -34,6 +50,15 @@ class SampleCreate(BaseModel):
     solute_mg_l: float | None = Field(default=None, ge=0, le=100000)
     detection_limit: float = Field(default=0, ge=0, le=100000)
     measurement_error: float = Field(default=0.05, ge=0, le=100)
+    observations: dict[str, ObservationSpec] = Field(default_factory=dict)
+
+    @field_validator("observations")
+    @classmethod
+    def reject_unknown_channels(cls, value: dict[str, ObservationSpec]) -> dict[str, ObservationSpec]:
+        unknown = sorted(set(value) - set(OBSERVATION_CHANNELS))
+        if unknown:
+            raise ValueError(f"未知观测通道: {','.join(unknown)}")
+        return value
 
 
 class InversionRequest(BaseModel):

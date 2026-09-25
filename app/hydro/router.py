@@ -34,6 +34,7 @@ def create_endmember(payload:EndmemberCreate): return service().create_endmember
 def add_sample(well_id:int,payload:SampleCreate):
     try: return service().add_sample(well_id,payload.model_dump())
     except KeyError as exc: raise HTTPException(404,"井点不存在") from exc
+    except ValueError as exc: raise HTTPException(422,str(exc)) from exc
 
 @router.post("/samples/{sample_id}/inversions",status_code=202)
 def enqueue_inversion(sample_id:int,payload:InversionRequest):
