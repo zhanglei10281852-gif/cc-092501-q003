@@ -26,7 +26,7 @@ CREATE TABLE IF NOT EXISTS hydro_samples (
  id INTEGER PRIMARY KEY AUTOINCREMENT, well_id INTEGER NOT NULL REFERENCES hydro_wells(id) ON DELETE RESTRICT,
  sample_code TEXT NOT NULL UNIQUE, sampled_at TEXT NOT NULL, isotope_d18o REAL, isotope_d2h REAL,
  solute_mg_l REAL, detection_limit REAL NOT NULL, measurement_error REAL NOT NULL,
- quality_status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL
+ quality_status TEXT NOT NULL DEFAULT 'pending', observations_json TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS hydro_inversions (
  id INTEGER PRIMARY KEY AUTOINCREMENT, sample_id INTEGER NOT NULL REFERENCES hydro_samples(id) ON DELETE RESTRICT,
@@ -54,7 +54,33 @@ def _now() -> str:
 
 
 def ensure_schema() -> None:
-    get_connection().executescript(SCHEMA)
+    connection = get_connection()
+    connection.executescript(SCHEMA)
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(hydro_samples)")}
+    if "observations_json" not in columns:
+        connection.execute("ALTER TABLE hydro_samples ADD COLUMN observations_json TEXT NOT NULL DEFAULT ''")
+
+
+TRACERS = ("isotope_d18o", "isotope_d2h", "solute_mg_l")
+OBSERVATION_ROLES = {"quantitative": "residual", "censored": "censored_likelihood", "missing": "excluded"}
+
+
+def _log_norm_cdf(z: float) -> float:
+    """标准正态分布的对数累积概率 log Φ(z)。
+
+    z 非常负时 erfc 会下溢为零，改用渐近展开 log Φ(z) ≈ -z²/2 - log(-z) - ½log(2π)，
+    保证删失似然在预测值远高于检出限时仍然有限、可复现。
+    """
+    if z < -36.0:
+        return -0.5 * z * z - math.log(-z) - 0.5 * math.log(2.0 * math.pi)
+    return math.log(0.5 * math.erfc(-z / math.sqrt(2.0)))
+
+
+def _mills_ratio(z: float) -> float:
+    """米尔斯比 φ(z)/Φ(z)，即删失对数似然对预测值的梯度系数。"""
+    if z < -36.0:
+        return -z - 1.0 / z
+    return math.exp(-0.5 * z * z - 0.5 * math.log(2.0 * math.pi) - _log_norm_cdf(z))
 
 
 def _digest(value: Any) -> str:
@@ -97,42 +123,167 @@ class HydroService:
             cursor=connection.execute("INSERT INTO hydro_endmembers(name,isotope_d18o,isotope_d2h,solute_mg_l,uncertainty,version,created_at) VALUES(?,?,?,?,?,?,?)",(payload["name"],payload["isotope_d18o"],payload["isotope_d2h"],payload["solute_mg_l"],payload["uncertainty"],payload["version"],now))
             return dict(connection.execute("SELECT * FROM hydro_endmembers WHERE id=?",(cursor.lastrowid,)).fetchone())
 
+    def _normalize_observations(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """把请求中的观测类型声明归一化为完整的三示踪剂规格并校验一致性。
+
+        未声明的示踪剂按历史规则派生（空值→missing，非空→quantitative）；
+        原始报告值不做任何改写，删失值只记录检出限阈值。
+        """
+        declared = payload.get("observations") or {}
+        normalized: dict[str, Any] = {}
+        for tracer in TRACERS:
+            value = payload.get(tracer)
+            spec = declared.get(tracer) or {}
+            obs_type = getattr(spec.get("type"), "value", spec.get("type"))
+            if obs_type is None:
+                obs_type = "missing" if value is None else "quantitative"
+            if obs_type not in OBSERVATION_ROLES:
+                raise ValueError(f"unknown_observation_type:{obs_type}")
+            if obs_type == "quantitative" and value is None:
+                raise ValueError(f"quantitative_requires_value:{tracer}")
+            if obs_type == "missing" and value is not None:
+                raise ValueError(f"missing_forbids_value:{tracer}")
+            entry: dict[str, Any] = {"type": obs_type}
+            if obs_type == "censored":
+                detection_limit = spec.get("detection_limit")
+                if detection_limit is None:
+                    detection_limit = payload.get("detection_limit") or 0.0
+                if detection_limit <= 0:
+                    raise ValueError(f"censored_requires_detection_limit:{tracer}")
+                entry["detection_limit"] = float(detection_limit)
+            normalized[tracer] = entry
+        return normalized
+
     def add_sample(self, well_id: int, payload: dict[str, Any]) -> dict[str, Any]:
         if self.connection.execute("SELECT id FROM hydro_wells WHERE id=?",(well_id,)).fetchone() is None: raise KeyError("well_not_found")
-        values=[payload.get("isotope_d18o"),payload.get("isotope_d2h"),payload.get("solute_mg_l")]
-        quality="usable" if sum(v is not None for v in values)>=2 else "incomplete"
+        observations=self._normalize_observations(payload)
+        measured=sum(1 for o in observations.values() if o["type"] in ("quantitative","censored"))
+        quality="usable" if measured>=2 else "incomplete"
         now=_now()
         with transaction(immediate=True) as connection:
-            cursor=connection.execute("INSERT INTO hydro_samples(well_id,sample_code,sampled_at,isotope_d18o,isotope_d2h,solute_mg_l,detection_limit,measurement_error,quality_status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",(well_id,payload["sample_code"],payload["sampled_at"],payload.get("isotope_d18o"),payload.get("isotope_d2h"),payload.get("solute_mg_l"),payload["detection_limit"],payload["measurement_error"],quality,now))
+            cursor=connection.execute("INSERT INTO hydro_samples(well_id,sample_code,sampled_at,isotope_d18o,isotope_d2h,solute_mg_l,detection_limit,measurement_error,quality_status,observations_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",(well_id,payload["sample_code"],payload["sampled_at"],payload.get("isotope_d18o"),payload.get("isotope_d2h"),payload.get("solute_mg_l"),payload["detection_limit"],payload["measurement_error"],quality,json.dumps(observations,ensure_ascii=False,sort_keys=True),now))
             return dict(connection.execute("SELECT * FROM hydro_samples WHERE id=?",(cursor.lastrowid,)).fetchone())
 
     def _project_simplex(self, values: list[float]) -> list[float]:
-        clipped=[max(0.0,v) for v in values]
-        total=sum(clipped)
-        return [1/len(values)]*len(values) if total<=1e-15 else [v/total for v in clipped]
+        """把点精确投影到概率单纯形上（Duchi 等人的欧氏投影算法）。"""
+        ordered=sorted(values,reverse=True)
+        cumulative=0.0
+        theta=0.0
+        for i,v in enumerate(ordered):
+            cumulative+=v
+            candidate=(cumulative-1.0)/(i+1)
+            if v-candidate>0: theta=candidate
+        return [max(v-theta,0.0) for v in values]
+
+    def _resolve_observations(self, sample: Any) -> list[dict[str, Any]]:
+        """读取样本的观测类型规格；历史行（observations_json 为空）按空值规则派生，报告值保持原样。"""
+        raw = sample["observations_json"] if "observations_json" in sample.keys() else ""
+        stored = json.loads(raw) if raw else {}
+        observations=[]
+        for tracer in TRACERS:
+            value=sample[tracer]
+            spec=stored.get(tracer) or {}
+            obs_type=spec.get("type") or ("missing" if value is None else "quantitative")
+            detection_limit=spec.get("detection_limit")
+            if obs_type=="censored":
+                if detection_limit is None: detection_limit=float(sample["detection_limit"])
+                detection_limit=float(detection_limit)
+                if detection_limit<=0: raise ValueError(f"censored_requires_detection_limit:{tracer}")
+            observations.append({"tracer":tracer,"type":obs_type,"value":value,"detection_limit":detection_limit})
+        return observations
+
+    def _unsolvable(self, reason: str, detail: str, observations: list[dict[str, Any]], summary: dict[str, int]) -> dict[str, Any]:
+        accounting=[]
+        for o in observations:
+            entry={"tracer":o["tracer"],"type":o["type"],"role":OBSERVATION_ROLES[o["type"]]}
+            if o["type"]=="quantitative": entry["value"]=o["value"]
+            if o["type"]=="censored": entry.update(value=o["value"],detection_limit=o["detection_limit"])
+            accounting.append(entry)
+        return {"status":"unsolvable","reason":reason,"reason_detail":detail,"fractions":None,**summary,"observations":accounting}
 
     def solve_mixture(self, sample: sqlite3.Row, endmembers: list[sqlite3.Row], max_iterations: int, tolerance: float) -> dict[str, Any]:
-        observed=[sample["isotope_d18o"],sample["isotope_d2h"],sample["solute_mg_l"]]
-        active=[i for i,v in enumerate(observed) if v is not None]
-        if len(active)<2: raise ValueError("insufficient_measurements")
+        observations=self._resolve_observations(sample)
+        measurement_error=float(sample["measurement_error"])
+        scales=[]
+        for k,o in enumerate(observations):
+            if k==0: scales.append(20.0)
+            elif k==1: scales.append(100.0)
+            elif o["type"]=="censored": scales.append(max(1.0,float(o["detection_limit"])))
+            else: scales.append(max(1.0,float(sample["solute_mg_l"] or 1)))
+        vectors=[[e["isotope_d18o"],e["isotope_d2h"],e["solute_mg_l"]] for e in endmembers]
+        required=len(endmembers)-1
+        quantitative=[k for k,o in enumerate(observations) if o["type"]=="quantitative"]
+        censored=[k for k,o in enumerate(observations) if o["type"]=="censored"]
+        missing=[k for k,o in enumerate(observations) if o["type"]=="missing"]
+        informative=[k for k in quantitative if max(v[k] for v in vectors)-min(v[k] for v in vectors)>1e-12]
+        summary={"quantitative_tracers":len(quantitative),"informative_quantitative_tracers":len(informative),"required_quantitative_tracers":required,"censored_tracers":len(censored),"missing_tracers":len(missing)}
+        if not quantitative:
+            return self._unsolvable("no_quantitative_measurements","样本没有定量测量值：低于检出限的删失数据与缺测项只能提供不等式约束，无法唯一确定端元比例",observations,summary)
+        if len(informative)<required:
+            return self._unsolvable("underdetermined_system",f"有效定量示踪剂只有{len(informative)}个，少于{len(endmembers)}个端元混合所需的最少{required}个，方程组欠定，无法唯一确定端元比例",observations,summary)
+
+        def evaluate(fractions: list[float]) -> tuple[float, list[float]]:
+            predicted=[sum(fractions[j]*vectors[j][k] for j in range(len(vectors))) for k in range(3)]
+            value=((sum(fractions)-1.0)*10)**2
+            for k in quantitative:
+                residual=(predicted[k]-float(observations[k]["value"]))/scales[k]
+                value+=residual*residual
+            for k in censored:
+                sigma=max(measurement_error*scales[k],1e-12)
+                value+=2.0*measurement_error**2*(-_log_norm_cdf((observations[k]["detection_limit"]-predicted[k])/sigma))
+            return value,predicted
+
         fractions=[1/len(endmembers)]*len(endmembers)
-        scale=[20.0,100.0,max(1.0,float(sample["solute_mg_l"] or 1))]
         rate=0.08
         last=float("inf")
+        objective=float("inf")
+        predicted=[sum(fractions[j]*vectors[j][k] for j in range(len(vectors))) for k in range(3)]
+        converged=False
+        iteration=-1
         for iteration in range(max_iterations):
-            predicted=[sum(fractions[j]*[e["isotope_d18o"],e["isotope_d2h"],e["solute_mg_l"]][k] for j,e in enumerate(endmembers)) for k in range(3)]
-            residual=[(predicted[k]-float(observed[k]))/scale[k] if k in active else 0.0 for k in range(3)]
-            objective=sum(r*r for r in residual)+((sum(fractions)-1.0)*10)**2
-            if abs(last-objective)<tolerance: break
+            objective,predicted=evaluate(fractions)
+            if abs(last-objective)<tolerance:
+                converged=True
+                break
             last=objective
             gradient=[]
-            for e in endmembers:
-                vector=[e["isotope_d18o"],e["isotope_d2h"],e["solute_mg_l"]]
-                gradient.append(2*sum(residual[k]*vector[k]/scale[k] for k in active))
-            fractions=self._project_simplex([f-rate*g for f,g in zip(fractions,gradient)])
-        predicted=[sum(fractions[j]*[e["isotope_d18o"],e["isotope_d2h"],e["solute_mg_l"]][k] for j,e in enumerate(endmembers)) for k in range(3)]
-        rmse=math.sqrt(sum(((predicted[k]-float(observed[k]))/scale[k])**2 for k in active)/len(active))
-        return {"fractions":[{"endmember_id":e["id"],"name":e["name"],"fraction":round(f,8)} for e,f in zip(endmembers,fractions)],"mass_balance":round(sum(fractions),10),"predicted":predicted,"rmse":rmse,"iterations":iteration+1,"converged":abs(last-objective)<tolerance}
+            for j in range(len(vectors)):
+                g=0.0
+                for k in quantitative:
+                    g+=2.0*((predicted[k]-float(observations[k]["value"]))/scales[k])*vectors[j][k]/scales[k]
+                for k in censored:
+                    sigma=max(measurement_error*scales[k],1e-12)
+                    g+=2.0*measurement_error**2*_mills_ratio((observations[k]["detection_limit"]-predicted[k])/sigma)/sigma*vectors[j][k]
+                gradient.append(g)
+            step=rate
+            for _ in range(30):
+                candidate=self._project_simplex([f-step*g for f,g in zip(fractions,gradient)])
+                candidate_objective,_=evaluate(candidate)
+                if candidate_objective<objective-1e-15:
+                    fractions=candidate
+                    break
+                step*=0.5
+            else:
+                converged=True
+                break
+        objective,predicted=evaluate(fractions)
+        result_observations=[]
+        censored_log_likelihood=0.0
+        for k,o in enumerate(observations):
+            entry={"tracer":o["tracer"],"type":o["type"],"role":OBSERVATION_ROLES[o["type"]]}
+            if o["type"]=="quantitative":
+                residual=(predicted[k]-float(o["value"]))/scales[k]
+                entry.update(value=o["value"],scale=scales[k],weight=round(1.0/scales[k],8),predicted=predicted[k],residual=residual)
+            elif o["type"]=="censored":
+                sigma=max(measurement_error*scales[k],1e-12)
+                z=(o["detection_limit"]-predicted[k])/sigma
+                log_likelihood=_log_norm_cdf(z)
+                censored_log_likelihood+=log_likelihood
+                entry.update(value=o["value"],detection_limit=o["detection_limit"],predicted=predicted[k],z_score=z,log_likelihood=log_likelihood)
+            result_observations.append(entry)
+        residuals=[(predicted[k]-float(observations[k]["value"]))/scales[k] for k in quantitative]
+        rmse=math.sqrt(sum(r*r for r in residuals)/len(residuals))
+        return {"status":"solved","reason":None,"reason_detail":None,"fractions":[{"endmember_id":e["id"],"name":e["name"],"fraction":round(f,8)} for e,f in zip(endmembers,fractions)],"mass_balance":round(sum(fractions),10),"predicted":predicted,"rmse":rmse,"objective":objective,"censored_log_likelihood":censored_log_likelihood,"iterations":iteration+1,"converged":converged,**summary,"observations":result_observations}
 
     def enqueue_inversion(self, sample_id: int, payload: dict[str, Any]) -> dict[str, Any]:
         sample=self.connection.execute("SELECT * FROM hydro_samples WHERE id=?",(sample_id,)).fetchone()

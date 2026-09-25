@@ -1,6 +1,25 @@
 from __future__ import annotations
 
+from enum import Enum
+
 from pydantic import BaseModel, Field, field_validator
+
+
+class Tracer(str, Enum):
+    ISOTOPE_D18O = "isotope_d18o"
+    ISOTOPE_D2H = "isotope_d2h"
+    SOLUTE_MG_L = "solute_mg_l"
+
+
+class ObservationType(str, Enum):
+    QUANTITATIVE = "quantitative"  # 定量值：实验室给出的确定测量结果
+    CENSORED = "censored"  # 左删失：低于检出限，真实值只知道小于检出限
+    MISSING = "missing"  # 真正缺失：如样品量不足导致的缺测
+
+
+class ObservationSpec(BaseModel):
+    type: ObservationType
+    detection_limit: float | None = Field(default=None, gt=0, le=100000)
 
 
 class WellCreate(BaseModel):
@@ -34,6 +53,7 @@ class SampleCreate(BaseModel):
     solute_mg_l: float | None = Field(default=None, ge=0, le=100000)
     detection_limit: float = Field(default=0, ge=0, le=100000)
     measurement_error: float = Field(default=0.05, ge=0, le=100)
+    observations: dict[Tracer, ObservationSpec] | None = None
 
 
 class InversionRequest(BaseModel):
